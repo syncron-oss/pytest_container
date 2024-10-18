@@ -2,8 +2,10 @@ import pytest
 
 try:
     import testinfra
-except ImportError:
-    raise pytest.skip("testinfra is not installed", allow_module_level=True)
+except ImportError as e:
+    raise pytest.skip(
+        "testinfra is not installed", allow_module_level=True
+    ) from e
 
 from pytest_container.container import ContainerData
 from .images import BUSYBOX

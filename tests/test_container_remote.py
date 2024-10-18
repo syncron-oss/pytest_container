@@ -30,7 +30,7 @@ def test_container_remote_file(container: ContainerData) -> None:
     with pytest.raises(
         ValueError, match="/usr/share/licenses/busybox is a directory"
     ):
-        d.content_string
+        d.content_string  # pylint: disable=pointless-statement
 
     # File
     f = container.remote.file("/usr/share/licenses/busybox/LICENSE")

@@ -1,3 +1,7 @@
+"""
+Module with compatibility helpers for different python versions.
+"""
+
 from typing import TYPE_CHECKING
 
 # mypy will try to import cached_property but fail to find its types

@@ -1,9 +1,9 @@
 """Unit tests of the Version class"""
+
 # pylint: disable=missing-function-docstring,missing-module-docstring
 import pytest
 from pytest_container import Version
-from pytest_container.runtime import _get_docker_version
-from pytest_container.runtime import _get_podman_version
+from pytest_container.runtime import _parse_tool_version
 from pytest_container.runtime import OciRuntimeBase
 
 # pragma pylint: disable=missing-function-docstring
@@ -138,7 +138,7 @@ def test_version_le_lt(larger: Version, smaller: Version):
     ],
 )
 def test_docker_version_extract(stdout: str, ver: Version):
-    assert _get_docker_version(stdout) == ver
+    assert _parse_tool_version("docker", stdout) == ver
 
 
 @pytest.mark.parametrize(
@@ -151,7 +151,7 @@ def test_docker_version_extract(stdout: str, ver: Version):
     ],
 )
 def test_podman_version_extract(stdout: str, ver: Version):
-    assert _get_podman_version(stdout) == ver
+    assert _parse_tool_version("podman", stdout) == ver
 
 
 def test_container_runtime_parsing(container_runtime: OciRuntimeBase):
