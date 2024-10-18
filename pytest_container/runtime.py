@@ -3,8 +3,11 @@ implementation details of container runtimes like :command:`docker` or
 :command:`podman`.
 
 """
+
 import json
 import re
+import shutil
+import subprocess
 import sys
 from abc import ABC
 from abc import abstractmethod
@@ -12,15 +15,15 @@ from dataclasses import dataclass
 from dataclasses import field
 from os import getenv
 from pathlib import Path
-from subprocess import check_output
 from typing import Any
 from typing import Callable
+from typing import Dict
 from typing import List
 from typing import Optional
+from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import Union
 
-import testinfra
 from _pytest.mark.structures import ParameterSet
 from pytest import param
 from pytest_container.inspect import BindMount
@@ -33,6 +36,7 @@ from pytest_container.inspect import HealthCheck
 from pytest_container.inspect import NetworkProtocol
 from pytest_container.inspect import PortForwarding
 from pytest_container.inspect import VolumeMount
+from pytest_container.logging import _logger
 
 
 if sys.version_info >= (3, 8):
@@ -40,16 +44,7 @@ if sys.version_info >= (3, 8):
 else:
     from typing_extensions import Literal
 
-# mypy will try to import cached_property but fail to find its types
-# since we run mypy with the most recent python version, we can simply import
-# cached_property from stdlib and we'll be fine
-if TYPE_CHECKING:  # pragma: no cover
-    from functools import cached_property
-else:
-    try:
-        from functools import cached_property
-    except ImportError:
-        from cached_property import cached_property
+from .compat import cached_property
 
 if TYPE_CHECKING:  # pragma: no cover
     import pytest_container
@@ -143,16 +138,16 @@ class Version:
         return Version(
             major=int(matches.group("major")),
             minor=int(matches.group("minor")) if matches.group("minor") else 0,
-            patch=int(matches.group("patch"))
-            if matches.group("patch")
-            else None,
+            patch=(
+                int(matches.group("patch")) if matches.group("patch") else None
+            ),
             build=matches.group("build") or "",
             release=matches.group("release") or None,
         )
 
     @staticmethod
     def __generate_cmp(
-        cmp_func: Callable[[int, int], bool]
+        cmp_func: Callable[[int, int], bool],
     ) -> Callable[["Version", Any], bool]:
         def cmp(self: Version, other: Any) -> bool:
             if not isinstance(other, Version):
@@ -179,10 +174,20 @@ class Version:
         return Version.__generate_cmp(lambda m, n: m > n)(self, other)
 
 
+def _parse_tool_version(tool_name: str, version_stdout: str) -> Version:
+    parts = version_stdout.split()
+    if not parts[0].startswith(tool_name):
+        raise RuntimeError(
+            f"Could not decode the {tool_name} version from {version_stdout}"
+        )
+    assert parts[1] == "version"
+    return Version.parse(parts[2])
+
+
 @dataclass(frozen=True)
 class _OciRuntimeBase:
     #: command that builds the Dockerfile in the current working directory
-    build_command: List[str] = field(default_factory=list)
+    build_command: Tuple[str, ...] = field(default_factory=tuple)
     #: the "main" binary of this runtime, e.g. podman or docker
     runner_binary: str = ""
     _runtime_functional: bool = False
@@ -190,14 +195,6 @@ class _OciRuntimeBase:
 
 class OciRuntimeABC(ABC):
     """The abstract base class defining the interface of a container runtime."""
-
-    @staticmethod
-    @abstractmethod
-    def _runtime_error_message() -> str:
-        """Returns a human readable error message why the runtime does not
-        function.
-
-        """
 
     def get_container_health(self, container_id: str) -> ContainerHealth:
         """Inspects the running container with the supplied id and returns its current
@@ -227,21 +224,14 @@ class OciRuntimeABC(ABC):
 
         """
 
+    @property
+    @abstractmethod
+    def family(self) -> Literal["docker", "podman"]:
+        """The family of the container runtime, either ``docker`` or ``podman``."""
+
 
 class OciRuntimeBase(_OciRuntimeBase, OciRuntimeABC, ToParamMixin):
     """Base class of the Container Runtimes."""
-
-    def __post_init__(self) -> None:
-        if not self.build_command or not self.runner_binary:
-            raise ValueError(
-                f"build_command ({self.build_command}) or runner_binary "
-                f"({self.runner_binary}) were not specified"
-            )
-        if not self._runtime_functional:
-            raise RuntimeError(
-                f"The runtime {self.__class__.__name__} is not functional: "
-                + self._runtime_error_message()
-            )
 
     @staticmethod
     def get_image_id_from_iidfile(iidfile_path: str) -> str:
@@ -280,31 +270,30 @@ class OciRuntimeBase(_OciRuntimeBase, OciRuntimeABC, ToParamMixin):
             else str(image_or_id_or_container)
         )
         return float(
-            check_output(
-                [
-                    self.runner_binary,
-                    "inspect",
-                    "-f",
-                    '"{{ .Size }}"',
-                    id_to_inspect,
-                ]
-            )
-            .decode()
-            .strip()
-            .replace('"', "")
+            self.run_command(
+                "inspect",
+                "-f",
+                '"{{ .Size }}"',
+                id_to_inspect,
+            ).replace('"', "")
         )
 
-    def _get_container_inspect(self, container_id: str) -> Any:
+    def _run_inspect(self, container_id: str) -> Union[Dict[str, Any], None]:
         inspect = json.loads(
-            check_output([self.runner_binary, "inspect", container_id])
+            self.run_command("inspect", container_id, ignore_errors=True)
         )
-        if len(inspect) != 1:
+        if not isinstance(inspect, list):
+            raise RuntimeError(
+                f"Expected a list of results, but got {inspect} instead"
+            )
+
+        if len(inspect) > 1:
             raise RuntimeError(
                 f"Got {len(inspect)} results back, "
                 f"but expected exactly one container to match {container_id}"
             )
 
-        return inspect[0]
+        return inspect[0] if inspect else None
 
     def _get_image_entrypoint_cmd(
         self, image_url_or_id: str, query_type: Literal["Entrypoint", "Cmd"]
@@ -314,20 +303,40 @@ class OciRuntimeBase(_OciRuntimeBase, OciRuntimeABC, ToParamMixin):
         defined.
 
         """
-        entrypoint = (
-            check_output(
-                [
-                    self.runner_binary,
-                    "inspect",
-                    "-f",
-                    f"{{{{.Config.{query_type}}}}}",
-                    image_url_or_id,
-                ]
-            )
-            .decode("utf-8")
-            .strip()
+        entrypoint = self.run_command(
+            "inspect", "-f", f"{{{{.Config.{query_type}}}}}", image_url_or_id
         )
         return None if entrypoint == "[]" else entrypoint
+
+    def run_command(
+        self,
+        *args: str,
+        ignore_errors: bool = False,
+        strip: bool = True,
+    ) -> str:
+        """
+        Run a command with the runner binary and return the output.
+
+        :param args: the arguments to pass to the runner binary
+        :param ignore_errors: return the output even if the command fails, logs stderr (default: False)
+        :param strip: strip the output from whitespace before returning it (default: True)
+        """
+        cmd = [self.runner_binary]
+        cmd.extend(args)
+        result: str
+        try:
+            # universal_newlines is an alias for text before python 3.7
+            result = subprocess.check_output(
+                cmd, stderr=subprocess.PIPE, universal_newlines=True
+            )
+        except subprocess.CalledProcessError as exc:
+            if not ignore_errors:
+                _logger.error(exc.stderr)
+                raise exc
+            result = exc.stdout
+        if strip:
+            result = result.strip()
+        return result
 
     @staticmethod
     def _stop_signal_from_inspect_conf(inspect_conf: Any) -> Union[int, str]:
@@ -420,29 +429,11 @@ class OciRuntimeBase(_OciRuntimeBase, OciRuntimeABC, ToParamMixin):
         return self.__class__.__name__
 
 
-LOCALHOST = testinfra.host.get_host("local://")
+class _AutoDetect:
+    INSTANCE: "_AutoDetect"
 
 
-def _get_podman_version(version_stdout: str) -> Version:
-    if version_stdout[:15] != "podman version ":
-        raise RuntimeError(
-            f"Could not decode the podman version from '{version_stdout}'"
-        )
-
-    return Version.parse(version_stdout[15:])
-
-
-def _get_buildah_version() -> Version:
-    version_stdout = LOCALHOST.run_expect([0], "buildah --version").stdout
-    build_version_begin = "buildah version "
-    if not version_stdout.startswith(build_version_begin):
-        raise RuntimeError(
-            f"Could not decode the buildah version from '{version_stdout}'"
-        )
-
-    return Version.parse(
-        version_stdout.replace(build_version_begin, "").split(" ")[0]
-    )
+_AutoDetect.INSTANCE = _AutoDetect()
 
 
 class PodmanRuntime(OciRuntimeBase):
@@ -451,38 +442,54 @@ class PodmanRuntime(OciRuntimeBase):
 
     """
 
-    _runtime_functional = LOCALHOST.run("podman ps").succeeded
-    _buildah_functional = LOCALHOST.run("buildah").succeeded
+    _buildah_binary: Optional[str] = None
 
-    @staticmethod
-    def _runtime_error_message() -> str:
-        if PodmanRuntime._runtime_functional:
-            return ""
+    def __init__(
+        self,
+        runner_binary: str = "podman",
+        buildah_binary: Union[str, _AutoDetect, None] = _AutoDetect.INSTANCE,
+    ) -> None:
+        resolved_buildah_binary: Optional[str] = None
 
-        podman_ps = LOCALHOST.run("podman ps")
-        assert (
-            not podman_ps.succeeded
-        ), "podman runtime is not functional, but 'podman ps' succeeded"
-        return str(podman_ps.stderr)
+        if buildah_binary is _AutoDetect.INSTANCE:
+            # try to guess if argument is omitted
+            buildah_binary = shutil.which("buildah")
 
-    def __init__(self) -> None:
+        if buildah_binary is None:
+            # if explicitly set to None or not found, we don't have buildah
+            resolved_buildah_binary = None
+
+        elif isinstance(buildah_binary, str):
+            # make sure it's fully resolved and not just a binary name
+            buildah_binary = shutil.which("buildah")
+            if buildah_binary is not None:
+                retcode = subprocess.run(
+                    [buildah_binary, "--version"], check=False
+                ).returncode
+                if retcode == 0:
+                    resolved_buildah_binary = buildah_binary
+
         super().__init__(
-            build_command=(
-                ["buildah", "bud", "--layers", "--force-rm"]
-                if self._buildah_functional
-                else ["podman", "build", "--layers", "--force-rm"]
+            build_command=tuple(
+                [resolved_buildah_binary, "bud", "--layers", "--force-rm"]
+                if resolved_buildah_binary is not None
+                else [runner_binary, "build", "--layers", "--force-rm"]
             ),
-            runner_binary="podman",
+            runner_binary=runner_binary,
             _runtime_functional=self._runtime_functional,
         )
+
+        self._buildah_binary = resolved_buildah_binary
 
     # pragma pylint: disable=used-before-assignment
     @cached_property
     def version(self) -> Version:
         """Returns the version of podman installed on the system"""
-        return _get_podman_version(
-            LOCALHOST.run_expect([0], "podman --version").stdout
-        )
+        return _parse_tool_version("podman", self.run_command("--version"))
+
+    @property
+    def family(self) -> Literal["podman"]:
+        return "podman"
 
     @cached_property
     def supports_healthcheck_inherit_from_base(self) -> bool:
@@ -493,15 +500,23 @@ class PodmanRuntime(OciRuntimeBase):
         podman_recent_enough = self.version >= Version(4, 1, 0)
 
         # if buildah isn't installed, don't check the buildah version
-        if not self._buildah_functional:
+        if not self._buildah_binary:
             return podman_recent_enough
 
-        return podman_recent_enough and _get_buildah_version() >= Version(
-            1, 25, 0
+        assert self._buildah_binary is not None
+        buildah_version = _parse_tool_version(
+            "buildah",
+            subprocess.check_output(
+                [self._buildah_binary, "--version"]
+            ).decode(),
         )
 
+        return podman_recent_enough and buildah_version >= Version(1, 25, 0)
+
     def inspect_container(self, container_id: str) -> ContainerInspect:
-        inspect = self._get_container_inspect(container_id)
+        inspect = self._run_inspect(container_id)
+        if not inspect:
+            raise RuntimeError(f"Container with id {container_id} not found")
 
         config = inspect["Config"]
         healthcheck = None
@@ -544,51 +559,34 @@ class PodmanRuntime(OciRuntimeBase):
         )
 
 
-def _get_docker_version(version_stdout: str) -> Version:
-    if version_stdout[:15].lower() != "docker version ":
-        raise RuntimeError(
-            f"Could not decode the docker version from {version_stdout}"
-        )
-
-    return Version.parse(version_stdout[15:].replace(",", ""))
-
-
 class DockerRuntime(OciRuntimeBase):
     """The container runtime using :command:`docker` for building and running
     containers."""
 
-    _runtime_functional = LOCALHOST.run("docker ps").succeeded
-
-    @staticmethod
-    def _runtime_error_message() -> str:
-        if DockerRuntime._runtime_functional:
-            return ""
-        docker_ps = LOCALHOST.run("docker ps")
-        assert (
-            not docker_ps.succeeded
-        ), "docker runtime is not functional, but 'docker ps' succeeded"
-        return str(docker_ps.stderr)
-
-    def __init__(self) -> None:
+    def __init__(self, runner_binary: str = "docker") -> None:
         super().__init__(
-            build_command=["docker", "build", "--force-rm"],
-            runner_binary="docker",
+            build_command=(runner_binary, "build", "--force-rm"),
+            runner_binary=runner_binary,
             _runtime_functional=self._runtime_functional,
         )
 
     @cached_property
     def version(self) -> Version:
         """Returns the version of docker installed on this system"""
-        return _get_docker_version(
-            LOCALHOST.run_expect([0], "docker --version").stdout
-        )
+        return _parse_tool_version("docker", self.run_command("--version"))
+
+    @property
+    def family(self) -> Literal["docker"]:
+        return "docker"
 
     @property
     def supports_healthcheck_inherit_from_base(self) -> bool:
         return True
 
     def inspect_container(self, container_id: str) -> ContainerInspect:
-        inspect = self._get_container_inspect(container_id)
+        inspect = self._run_inspect(container_id)
+        if not inspect:
+            raise RuntimeError(f"Container with id {container_id} not found")
 
         config = inspect["Config"]
         if config.get("Env"):
@@ -632,6 +630,34 @@ class DockerRuntime(OciRuntimeBase):
         )
 
 
+@dataclass
+class CachedRuntime:
+    requested_runtime: str
+    resolved_runtime_family: Literal["docker", "podman"]
+    runtime: Union[OciRuntimeBase, ValueError]
+
+
+_CACHED_RUNTIME: Optional[CachedRuntime] = None
+
+
+def _resolve_runtime(requested: str) -> Tuple[str, Optional[str]]:
+    if requested not in ["docker", "podman", "auto"]:
+        raise ValueError(f"Invalid CONTAINER_RUNTIME value: {requested}")
+    current = requested
+    if current == "auto":
+        podmain_path = shutil.which("podman")
+        if podmain_path:
+            current = "podman"
+        else:
+            docker_path = shutil.which("docker")
+            if docker_path:
+                current = "docker"
+            else:
+                raise ValueError("Neither podman nor docker are installed")
+
+    return current, shutil.which(current)
+
+
 def get_selected_runtime() -> OciRuntimeBase:
     """Returns the container runtime that the user selected.
 
@@ -641,18 +667,44 @@ def get_selected_runtime() -> OciRuntimeBase:
 
     If neither docker nor podman are available, then a ValueError is raised.
     """
-    podman_exists = LOCALHOST.exists("podman")
-    docker_exists = LOCALHOST.exists("docker")
+    global _CACHED_RUNTIME
+    requested = getenv("CONTAINER_RUNTIME", "auto").lower()
 
-    runtime_choice = getenv("CONTAINER_RUNTIME", "podman").lower()
-    if runtime_choice not in ("podman", "docker"):
-        raise ValueError(f"Invalid CONTAINER_RUNTIME {runtime_choice}")
+    if (
+        _CACHED_RUNTIME is not None
+        and _CACHED_RUNTIME.requested_runtime != requested
+    ):
+        # check if the user changed the runtime via an environment variable
+        _CACHED_RUNTIME = None
 
-    if runtime_choice == "podman" and podman_exists:
-        return PodmanRuntime()
-    if runtime_choice == "docker" and docker_exists:
-        return DockerRuntime()
+    if _CACHED_RUNTIME is None:
+        resolved, binary = _resolve_runtime(requested)
+        if resolved == "docker":
+            _CACHED_RUNTIME = CachedRuntime(
+                requested_runtime=requested,
+                resolved_runtime_family="docker",
+                runtime=(
+                    DockerRuntime(binary)
+                    if binary
+                    else ValueError("docker runtime missing or not functional")
+                ),
+            )
+        elif resolved == "podman":
+            _CACHED_RUNTIME = CachedRuntime(
+                requested_runtime=requested,
+                resolved_runtime_family="podman",
+                runtime=(
+                    PodmanRuntime(binary)
+                    if binary
+                    else ValueError("podman runtime missing or not functional")
+                ),
+            )
+        else:
+            raise ValueError(
+                f"Resolved runtime is neither docker nor podman: {resolved}"
+            )
 
-    raise ValueError(
-        "Selected runtime " + runtime_choice + " does not exist on the system"
-    )
+    if isinstance(_CACHED_RUNTIME.runtime, ValueError):
+        raise _CACHED_RUNTIME.runtime
+
+    return _CACHED_RUNTIME.runtime
