@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pytest_container"
-version = "0.4.2"
+version = "0.4.2.post+syncron.1" # Add local version, so it's clear that this is a local build
 description = "Pytest fixtures for writing container based tests"
 authors = ["Dan Čermák <dcermak@suse.com>"]
 homepage = "https://dcermak.github.io/pytest_container/"
